@@ -31,6 +31,7 @@ from mlflow.protos.databricks_pb2 import (
     BAD_REQUEST,
     RESOURCE_DOES_NOT_EXIST,
     INVALID_PARAMETER_VALUE,
+    TEMPORARILY_UNAVAILABLE,
 )
 from mlflow.store.tracking import SEARCH_MAX_RESULTS_DEFAULT
 from mlflow.store.db.utils import (
@@ -600,8 +601,7 @@ class TestSqlAlchemyStore(unittest.TestCase, AbstractStoreTest):
         # Patch `is_local_uri` to prevent the SqlAlchemy store from attempting to create local
         # filesystem directories for file URI and POSIX path test cases
         with mock.patch("mlflow.store.tracking.sqlalchemy_store.is_local_uri", return_value=False):
-            for i in range(len(cases)):
-                artifact_root_uri, expected_artifact_uri_format = cases[i]
+            for artifact_root_uri, expected_artifact_uri_format in cases:
                 with TempDir() as tmp:
                     dbfile_path = tmp.path("db")
                     store = SqlAlchemyStore(
@@ -662,8 +662,7 @@ class TestSqlAlchemyStore(unittest.TestCase, AbstractStoreTest):
         # Patch `is_local_uri` to prevent the SqlAlchemy store from attempting to create local
         # filesystem directories for file URI and POSIX path test cases
         with mock.patch("mlflow.store.tracking.sqlalchemy_store.is_local_uri", return_value=False):
-            for i in range(len(cases)):
-                artifact_root_uri, expected_artifact_uri_format = cases[i]
+            for artifact_root_uri, expected_artifact_uri_format in cases:
                 with TempDir() as tmp:
                     dbfile_path = tmp.path("db")
                     store = SqlAlchemyStore(
@@ -1145,15 +1144,27 @@ class TestSqlAlchemyStore(unittest.TestCase, AbstractStoreTest):
         tval = None
         param = entities.Param(tkey, tval)
 
+        dialect = self.store._get_dialect()
         regex = {
             SQLITE: r"NOT NULL constraint failed",
             POSTGRES: r"null value in column .+ of relation .+ violates not-null constrain",
             MYSQL: r"Column .+ cannot be null",
             MSSQL: r"Cannot insert the value NULL into column .+, table .+",
-        }[self.store._get_dialect()]
+        }[dialect]
         with pytest.raises(MlflowException, match=regex) as exception_context:
             self.store.log_param(run.info.run_id, param)
-        assert exception_context.value.error_code == ErrorCode.Name(BAD_REQUEST)
+        if dialect != MYSQL:
+            assert exception_context.value.error_code == ErrorCode.Name(BAD_REQUEST)
+        else:
+            # Some MySQL client packages (and there are several available, e.g.
+            # PyMySQL, mysqlclient, mysql-connector-python... reports some
+            # errors, including NULL constraint violations, as a SQLAlchemy
+            # OperationalError, even though they should be reported as a more
+            # generic SQLAlchemyError. If that is fixed, we can remove this
+            # special case.
+            assert exception_context.value.error_code == ErrorCode.Name(
+                BAD_REQUEST
+            ) or exception_context.value.error_code == ErrorCode.Name(TEMPORARILY_UNAVAILABLE)
 
     def test_log_param_max_length_value(self):
         run = self._run_factory()
@@ -1189,17 +1200,17 @@ class TestSqlAlchemyStore(unittest.TestCase, AbstractStoreTest):
         experiment2 = self.store.get_experiment(exp_id_2)
         assert experiment2.tags["tag0"] == "differentValue"
         # test can set multi-line tags
-        multiLineTag = entities.ExperimentTag("multiline tag", "value2\nvalue2\nvalue2")
-        self.store.set_experiment_tag(exp_id, multiLineTag)
+        multi_line_Tag = entities.ExperimentTag("multiline tag", "value2\nvalue2\nvalue2")
+        self.store.set_experiment_tag(exp_id, multi_line_Tag)
         experiment = self.store.get_experiment(exp_id)
         assert experiment.tags["multiline tag"] == "value2\nvalue2\nvalue2"
         # test cannot set tags that are too long
-        longTag = entities.ExperimentTag("longTagKey", "a" * 5001)
+        long_tag = entities.ExperimentTag("longTagKey", "a" * 5001)
         with pytest.raises(MlflowException, match="exceeded length limit of 5000"):
-            self.store.set_experiment_tag(exp_id, longTag)
+            self.store.set_experiment_tag(exp_id, long_tag)
         # test can set tags that are somewhat long
-        longTag = entities.ExperimentTag("longTagKey", "a" * 4999)
-        self.store.set_experiment_tag(exp_id, longTag)
+        long_tag = entities.ExperimentTag("longTagKey", "a" * 4999)
+        self.store.set_experiment_tag(exp_id, long_tag)
         # test cannot set tags on deleted experiments
         self.store.delete_experiment(exp_id)
         with pytest.raises(MlflowException, match="must be in the 'active' state"):
